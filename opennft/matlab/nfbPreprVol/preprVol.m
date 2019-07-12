@@ -14,22 +14,13 @@ function preprVol(inpFileName, indVol)
 
 P = evalin('base', 'P');
 mainLoopData = evalin('base', 'mainLoopData');
+isShowSNR = evalin('base', 'isShowSNR');
+isSmoothed = evalin('base', 'isSmoothed');
+imageViewMode = evalin('base', 'imageViewMode');
+FIRST_SNR_VOLUME = evalin('base', 'FIRST_SNR_VOLUME');
 
 if indVol <= P.nrSkipVol
     return;
-end
-
-% Get Matlab time stamp related to # t2 using PTB-3 function.
-% For clarification, see OpenNFT timing diagram on the website and our ms.
-% Note that there is a small difference between this one and recordEvent()
-% times since they are taken subsequently. We also don't know how PTB
-% functions could deal with time-referencing issues between 2 parallel Matlab
-% processes, i.e. core process and PTB helper.
-if indVol == double(P.nrSkipVol)+1
-    P.expOns_t2 = GetSecs;
-    fprintf('\n\n=============')
-    fprintf('\nMatlab time stamp t2!')
-    fprintf('\n=============\n\n')
 end
 
 [isPSC, isDCM, isSVM, isIGLM] = getFlagsType(P);
@@ -71,13 +62,6 @@ img2DdimY = mainLoopData.img2DdimY;
 % Flags
 flagsSpmReslice = mainLoopData.flagsSpmReslice;
 flagsSpmRealign = mainLoopData.flagsSpmRealign;
-
-% iGLM init
-nrVoxInVol = mainLoopData.nrVoxInVol;
-nrBasFct = mainLoopData.nrBasFct;
-numscan = mainLoopData.numscan;
-spmMaskTh = mainLoopData.spmMaskTh;
-basFct = mainLoopData.basFct;
 
 % type conversion Matlab-Python bug
 indVolNorm = mainLoopData.indVolNorm;
@@ -148,7 +132,7 @@ reslVol = spm_reslice_rt(R, flagsSpmReslice);
 tStopMC = toc(tStartMotCorr);
 
 %% Smoothing
-if isPSC || isSVM
+if isPSC || isSVM || P.isRestingState
     gKernel = [5 5 5] ./ dicomInfoVox;
 end
 if isDCM
@@ -159,7 +143,44 @@ mainLoopData.gKernel = gKernel;
 smReslVol = zeros(dimVol);
 spm_smooth(reslVol, smReslVol, gKernel);
 
-if isPSC || isSVM
+statMap2D = zeros(img2DdimY, img2DdimX);
+
+if indVolNorm > FIRST_SNR_VOLUME
+    
+    [snrVol, mainLoopData.meanVol, mainLoopData.m2Vol, mainLoopData.meanVolSmoothed, mainLoopData.m2VolSmoothed] = snr_calc(indVolNorm, reslVol, smReslVol, mainLoopData.meanVol, mainLoopData.m2Vol,  mainLoopData.meanVolSmoothed, mainLoopData.m2VolSmoothed, isSmoothed);
+    mainLoopData.snrMapCreated = 1; 
+    
+    
+    if isShowSNR
+   
+        if imageViewMode == 1 || imageViewMode == 2
+            % orthviewAnat (1) || orthviewEPI (2)
+            fname = strrep(P.memMapFile, 'shared', 'SNRVol');
+            m_out = memmapfile(fname, 'Writable', true, 'Format',  {'double', prod(dimVol), 'snrVol'});
+            m_out.Data.snrVol = double(snrVol(:));
+
+        else
+            % mosaic (0)
+            statMap2D = vol3Dimg2D(snrVol, slNrImg2DdimX, slNrImg2DdimY, img2DdimX, img2DdimY, dimVol);
+            statMap2D = statMap2D-min(statMap2D(:));
+            statMap2D = (statMap2D / max(statMap2D(:))) * 255;
+            fname = strrep(P.memMapFile, 'shared', 'map_2D');
+            m_out = memmapfile(fname, 'Writable', true, 'Format',  {'uint8', img2DdimX*img2DdimY, 'map_2D'});
+            m_out.Data.map_2D = uint8(statMap2D(:));     
+            assignin('base', 'statMap2D', statMap2D);
+        
+        end
+           
+    end
+else
+    
+    mainLoopData.snrMapCreated = 0; 
+    
+end
+    
+
+    
+if isPSC || isSVM || P.isRestingState
     % Smoothed Vol 3D -> 2D
     smReslVol_2D = vol3Dimg2D(smReslVol, slNrImg2DdimX, slNrImg2DdimY, ...
         img2DdimX, img2DdimY, dimVol);
@@ -179,6 +200,13 @@ if isDCM
         mainLoopData.smReslVol_2D = smReslVol_2D;
     end
 end
+
+% iGLM init
+nrVoxInVol = mainLoopData.nrVoxInVol;
+nrBasFct = mainLoopData.nrBasFct;
+numscan = mainLoopData.numscan;
+spmMaskTh = mainLoopData.spmMaskTh;
+basFct = mainLoopData.basFct;
 
 %% AR(1) iGLM, i.e. after assigning _2D matrices used for ROI's extractions
 if P.iglmAR1
@@ -220,7 +248,7 @@ if isIGLM
         
         statMapVect = mainLoopData.statMapVect;
         statMap3D = mainLoopData.statMap3D; % this structure is set with 0
-        statMap2D = mainLoopData.statMap2D; % this structure is set with 0
+        tempStatMap2D = mainLoopData.statMap2D; % this structure is set with 0
         
         if ~fLockedTempl
             % assign Tempalte
@@ -290,11 +318,11 @@ if isIGLM
         statMap3D = zeros(dimVol);
         mainLoopData.statMapVect = statMapVect;
         mainLoopData.statMap3D = statMap3D;
-        statMap2D = zeros(img2DdimY,img2DdimX);
-        mainLoopData.statMap2D = statMap2D;
+        tempStatMap2D = zeros(img2DdimY,img2DdimX);
+        mainLoopData.statMap2D = tempStatMap2D;
     end
     
-    if isPSC || isSVM
+    if isPSC || isSVM || P.isRestingState
         indIglm = indVolNorm;
     end
     if isDCM
@@ -330,10 +358,19 @@ if isIGLM
     if P.iglmAR1
         tmpRegr = arRegr(P.aAR1,tmpRegr);
     end
-    % combine with prepared basFct design regressors
-    basFctRegr = [basFct(1:indIglm,:), tmpRegr];
-    % account for contrast term in contrast vector (+1)
-    tContr = [tContr; zeros(nrBasFctRegr,1)];
+    if ~P.isRestingState
+        % combine with prepared basFct design regressors
+        basFctRegr = [basFct(1:indIglm,:), tmpRegr];
+        % account for contrast term in contrast vector (+1)
+        tContr = [tContr; zeros(nrBasFctRegr,1)];
+    else
+        % combine with prepared basFct design regressors
+        basFctRegr = tmpRegr;
+        % account for contrast term in contrast vector (+1)
+        if  P.isMotionRegr && P.isLinRegr && P.isHighPass
+            tContr = [tContr; zeros(nrBasFctRegr-size(P.motCorrParam,2),1)];
+        end
+    end
     % estimate iGLM
     [idxActVoxIGLM, dyntTh, tTh, Cn, Dn, s2n, tn, neg_e2n] = ...
         iGlmVol(Cn, Dn, s2n, tn, smReslVol(:), indIglm, ...
@@ -360,7 +397,6 @@ end
 
 %% sharing iGLM results 
 mainLoopData.statMapCreated = 0;
-statMap_2D = zeros(img2DdimY,img2DdimX);
 if ~isempty(idxActVoxIGLM) && max(tn) > 0 % handle empty activation map
     % and division by 0
     maskedStatMapVect = tn(idxActVoxIGLM);
@@ -370,15 +406,23 @@ if ~isempty(idxActVoxIGLM) && max(tn) > 0 % handle empty activation map
     
     clear idxActVoxIGLM
     
-    statMap2D = vol3Dimg2D(statMap3D, slNrImg2DdimX, slNrImg2DdimY, ...
-        img2DdimX, img2DdimY, dimVol) / maxTval;
+    if ~isShowSNR && ~imageViewMode
+        statMap2D = vol3Dimg2D(statMap3D, slNrImg2DdimX, slNrImg2DdimY, ...
+            img2DdimX, img2DdimY, dimVol) / maxTval;
+
+        statMap2D = statMap2D * 255;
+        fname = strrep(P.memMapFile, 'shared', 'map_2D');
+        m_out = memmapfile(fname, 'Writable', true, 'Format',  {'uint8', img2DdimX*img2DdimY, 'map_2D'});
+        m_out.Data.map_2D = uint8(statMap2D(:));
+        assignin('base', 'statMap2D', statMap2D);
+    end
     
-    posIdx2D = find(statMap2D > 0);
-    pythonPosIdx2D = posIdx2D - 1;
-    
-    assignin('base', 'strIdx', matData2strData(pythonPosIdx2D));
-    tmpStrData = matData2strData(statMap2D(posIdx2D)*255);
-    assignin('base', 'strStatMap', tmpStrData);
+%     posIdx2D = find(statMap2D > 0);
+%     pythonPosIdx2D = posIdx2D - 1;
+%     
+%     assignin('base', 'strIdx', matData2strData(pythonPosIdx2D));
+%     tmpStrData = matData2strData(statMap2D(posIdx2D)*255);
+%     assignin('base', 'strStatMap', tmpStrData);
     
     % shared for SPM matlab helper
     m = evalin('base', 'mmStatVol');
@@ -404,7 +448,7 @@ else
 end
 
 tStopIGLM = toc(tStartMotCorr);
-fprintf('TIMING: %d iter - PREPROC MC: %d s - SMOOTH: %d s - IGLM: %d s\n',...
+fprintf('TIMING: %d iter - PREPROC MC: %d s - SMOOTH: %d s - IGLM: %d s',...
     nrIter, tStopMC, tStopSm-tStopMC, tStopIGLM-tStopSm);
 
 %% dynamic ROI mask based on statMap2D
